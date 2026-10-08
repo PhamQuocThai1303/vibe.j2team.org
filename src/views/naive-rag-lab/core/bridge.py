@@ -59,16 +59,17 @@ def compute_pca_2d(matrix: Optional[np.ndarray], query_vec: Optional[np.ndarray]
         centered = data - mean
 
         _, sv, vt = np.linalg.svd(centered, full_matrices=False)
+        n_comps = min(3, vt.shape[0])
         var_total = float((sv ** 2).sum())
-        var_kept = float((sv[:2] ** 2).sum() / var_total) if var_total > 1e-9 else 1.0
+        var_kept = float((sv[:n_comps] ** 2).sum() / var_total) if var_total > 1e-9 else 1.0
 
-        proj = centered @ vt[:2].T
+        proj = centered @ vt[:n_comps].T
 
         # Chuẩn hoá tỷ lệ co dãn về khung [-1, 1]
         std = np.std(proj, axis=0)
         std = np.where(std < 1e-6, 1.0, std)
         proj_norm = (proj - np.mean(proj, axis=0)) / (2.5 * std)
-        proj_norm = np.clip(proj_norm, -1.0, 1.0)
+        proj_norm = np.clip(proj_norm, -0.9, 0.9)
 
         chunk_proj = proj_norm[: matrix.shape[0]]
         points = []
@@ -80,6 +81,7 @@ def compute_pca_2d(matrix: Optional[np.ndarray], query_vec: Optional[np.ndarray]
                 "id": i,
                 "x": float(chunk_proj[i, 0]),
                 "y": float(chunk_proj[i, 1]),
+                "z": float(chunk_proj[i, 2]) if n_comps >= 3 else 0.0,
                 "score": sc,
                 "is_top": i in top_set
             })
@@ -88,7 +90,8 @@ def compute_pca_2d(matrix: Optional[np.ndarray], query_vec: Optional[np.ndarray]
         if query_vec is not None:
             q_point = {
                 "x": float(proj_norm[-1, 0]),
-                "y": float(proj_norm[-1, 1])
+                "y": float(proj_norm[-1, 1]),
+                "z": float(proj_norm[-1, 2]) if n_comps >= 3 else 0.0
             }
 
         return {

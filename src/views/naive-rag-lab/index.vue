@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { Icon } from '@iconify/vue'
 import { useClipboard, useEventListener } from '@vueuse/core'
@@ -14,7 +14,7 @@ import type {
   PcaData,
   RetrieveResult,
 } from './core/types'
-import { ClientRagPipeline, SAMPLE_DOC_TEXT } from './core/rag-engine'
+import { ClientRagPipeline, computeClientPca, SAMPLE_DOC_TEXT } from './core/rag-engine'
 
 // --- Cấu hình & Trạng thái Engine ---
 const bridgeUrl = ref('http://127.0.0.1:8000')
@@ -108,6 +108,247 @@ const isScrolledUp = ref(false)
 const copiedMessageId = ref<string | null>(null)
 const activeTab = ref<'scores' | 'vectors' | 'chunks' | 'prompt' | 'compare'>('scores')
 
+// --- Chế độ hiển thị Vector (3D / 2D) & Camera 3D tương tác ---
+const vectorViewMode = ref<'3d' | '2d'>('3d') // Mặc định 3D cho trải nghiệm hiện đại
+const yaw3D = ref(0.65) // Góc xoay quanh trục Y (radians)
+const pitch3D = ref(0.35) // Góc nghiêng nhìn từ trên xuống (radians)
+const zoom3D = ref(1.05) // Hệ số thu phóng
+const isDragging3D = ref(false)
+const dragStartPos = ref({ x: 0, y: 0 })
+const dragStartAngles = ref({ yaw: 0.65, pitch: 0.35 })
+
+function resetCamera3D(): void {
+  yaw3D.value = 0.65
+  pitch3D.value = 0.35
+  zoom3D.value = 1.05
+}
+
+function onStartDrag3D(e: PointerEvent): void {
+  if (e.pointerType === 'mouse' && e.button !== 0) return
+  isDragging3D.value = true
+  dragStartPos.value = { x: e.clientX, y: e.clientY }
+  dragStartAngles.value = { yaw: yaw3D.value, pitch: pitch3D.value }
+  hoveredChunk.value = null
+}
+
+function onDrag3D(e: PointerEvent): void {
+  if (!isDragging3D.value) return
+  const dx = e.clientX - dragStartPos.value.x
+  const dy = e.clientY - dragStartPos.value.y
+
+  yaw3D.value = dragStartAngles.value.yaw - dx * 0.012
+  pitch3D.value = Math.max(-1.3, Math.min(1.3, dragStartAngles.value.pitch + dy * 0.012))
+}
+
+function onStopDrag3D(): void {
+  isDragging3D.value = false
+}
+
+function onWheel3D(e: WheelEvent): void {
+  e.preventDefault()
+  const delta = e.deltaY > 0 ? -0.08 : 0.08
+  zoom3D.value = Math.max(0.6, Math.min(2.5, Math.round((zoom3D.value + delta) * 100) / 100))
+}
+
+useEventListener(window, 'pointermove', (e: PointerEvent) => {
+  if (isDragging3D.value) {
+    onDrag3D(e)
+  }
+})
+
+useEventListener(window, 'pointerup', () => {
+  if (isDragging3D.value) {
+    onStopDrag3D()
+  }
+})
+
+interface ProjectedPoint3D {
+  id: number
+  x: number
+  y: number
+  z: number
+  sx: number
+  sy: number
+  depth: number
+  projScale: number
+  score: number
+  is_top: boolean
+}
+
+function project3D(
+  x: number,
+  y: number,
+  z: number,
+): { sx: number; sy: number; depth: number; scale: number } {
+  const fov = 3.2
+  const cosY = Math.cos(yaw3D.value)
+  const sinY = Math.sin(yaw3D.value)
+  const cosP = Math.cos(pitch3D.value)
+  const sinP = Math.sin(pitch3D.value)
+
+  // 1. Xoay quanh trục Y (Yaw)
+  const x1 = x * cosY + z * sinY
+  const z1 = -x * sinY + z * cosY
+
+  // 2. Xoay quanh trục X (Pitch)
+  const y2 = y * cosP - z1 * sinP
+  const z2 = y * sinP + z1 * cosP
+
+  // 3. Phép chiếu phối cảnh Perspective
+  const perspective = fov / (fov + z2)
+  const scale = perspective * zoom3D.value
+
+  return {
+    sx: x1 * scale,
+    sy: y2 * scale,
+    depth: z2,
+    scale,
+  }
+}
+
+// Danh sách các điểm Chunk 3D được sắp xếp theo độ sâu (Z-sorting)
+const projectedChunkPoints3D = computed<ProjectedPoint3D[]>(() => {
+  if (!pcaData.value || pcaData.value.points.length === 0) return []
+  const list: ProjectedPoint3D[] = pcaData.value.points.map((pt) => {
+    const p = project3D(pt.x, pt.y, pt.z ?? 0)
+    return {
+      id: pt.id,
+      x: pt.x,
+      y: pt.y,
+      z: pt.z ?? 0,
+      sx: p.sx,
+      sy: p.sy,
+      depth: p.depth,
+      projScale: p.scale,
+      score: pt.score,
+      is_top: pt.is_top,
+    }
+  })
+  // Painter's algorithm: vẽ điểm sâu (xa) trước, điểm gần vẽ sau
+  return list.sort((a, b) => b.depth - a.depth)
+})
+
+// Điểm Query trong không gian 3D
+const projectedQueryPoint3D = computed(() => {
+  if (!pcaData.value?.query) return null
+  const q = pcaData.value.query
+  const p = project3D(q.x, q.y, q.z ?? 0)
+  return {
+    sx: p.sx,
+    sy: p.sy,
+    depth: p.depth,
+    scale: p.scale,
+  }
+})
+
+// Đường liên kết từ Query tới các Top-K Chunks trong 3D
+const projectedQueryLinks3D = computed(() => {
+  if (!pcaData.value?.query) return []
+  const q = project3D(pcaData.value.query.x, pcaData.value.query.y, pcaData.value.query.z ?? 0)
+  const topPoints = pcaData.value.points.filter((p) => p.is_top)
+  return topPoints.map((pt) => {
+    const target = project3D(pt.x, pt.y, pt.z ?? 0)
+    return {
+      x1: q.sx,
+      y1: q.sy,
+      x2: target.sx,
+      y2: target.sy,
+    }
+  })
+})
+
+// Các trục tọa độ 3D (PC1: Coral, PC2: Sky, PC3: Amber)
+const projectedAxes3D = computed(() => {
+  const origin = project3D(0, 0, 0)
+  const axX = project3D(0.85, 0, 0)
+  const axY = project3D(0, -0.85, 0)
+  const axZ = project3D(0, 0, 0.85)
+  return {
+    origin,
+    x: { ...axX, label: 'PC1', color: '#FF6B6B' },
+    y: { ...axY, label: 'PC2', color: '#38BDF8' },
+    z: { ...axZ, label: 'PC3', color: '#FFB830' },
+  }
+})
+
+interface Line3D {
+  x1: number
+  y1: number
+  x2: number
+  y2: number
+  depth: number
+}
+
+// Khung lồng không gian 3D (3D Bounding Cube Cage)
+const projectedWireframe3D = computed<Line3D[]>(() => {
+  const s = 0.75
+  const rawEdges: Array<[[number, number, number], [number, number, number]]> = [
+    // Mặt đáy (Floor)
+    [
+      [-s, s, -s],
+      [s, s, -s],
+    ],
+    [
+      [s, s, -s],
+      [s, s, s],
+    ],
+    [
+      [s, s, s],
+      [-s, s, s],
+    ],
+    [
+      [-s, s, s],
+      [-s, s, -s],
+    ],
+    // Cột đứng
+    [
+      [-s, -s, -s],
+      [-s, s, -s],
+    ],
+    [
+      [s, -s, -s],
+      [s, s, -s],
+    ],
+    [
+      [s, -s, s],
+      [s, s, s],
+    ],
+    [
+      [-s, -s, s],
+      [-s, s, s],
+    ],
+    // Mặt trên (Ceiling)
+    [
+      [-s, -s, -s],
+      [s, -s, -s],
+    ],
+    [
+      [s, -s, -s],
+      [s, -s, s],
+    ],
+    [
+      [s, -s, s],
+      [-s, -s, s],
+    ],
+    [
+      [-s, -s, s],
+      [-s, -s, -s],
+    ],
+  ]
+
+  return rawEdges.map(([p1, p2]) => {
+    const a = project3D(p1[0]!, p1[1]!, p1[2]!)
+    const b = project3D(p2[0]!, p2[1]!, p2[2]!)
+    return {
+      x1: a.sx,
+      y1: a.sy,
+      x2: b.sx,
+      y2: b.sy,
+      depth: (a.depth + b.depth) / 2,
+    }
+  })
+})
+
 function onChatScroll(): void {
   if (!chatContainer.value) return
   const { scrollTop, scrollHeight, clientHeight } = chatContainer.value
@@ -198,24 +439,33 @@ function copySelectedChunkText(): void {
 
 function updateHoverPos(e: MouseEvent): void {
   const popupWidth = 360
-  const popupHeight = 220
-  let x = e.clientX + 16
-  let y = e.clientY + 16
+  const popupHeight = 200
+  const margin = 12
 
-  if (x + popupWidth > window.innerWidth - 12) {
-    x = Math.max(12, e.clientX - popupWidth - 16)
+  let x = e.clientX + margin
+  let y = e.clientY + margin
+
+  if (x + popupWidth > window.innerWidth - margin) {
+    x = Math.max(margin, e.clientX - popupWidth - margin)
   }
-  if (y + popupHeight > window.innerHeight - 12) {
-    y = Math.max(12, e.clientY - popupHeight - 16)
-  }
-  if (y < 20) {
-    y = 20
+  if (y + popupHeight > window.innerHeight - margin) {
+    y = Math.max(margin, e.clientY - popupHeight - margin)
   }
 
   hoverPos.value = { x, y }
 }
 
+let leaveTimer: ReturnType<typeof setTimeout> | null = null
+
+function cancelLeaveTimer(): void {
+  if (leaveTimer) {
+    clearTimeout(leaveTimer)
+    leaveTimer = null
+  }
+}
+
 function onHoverBar(e: MouseEvent, idx: number, score: number): void {
+  cancelLeaveTimer()
   const c = chunks.value.find((item) => item.id === idx)
   if (!c) return
   const hit = lastResult.value?.hits.find((h) => h.id === idx)
@@ -231,6 +481,7 @@ function onHoverBar(e: MouseEvent, idx: number, score: number): void {
 }
 
 function onHoverVector(e: MouseEvent, ptId: number): void {
+  cancelLeaveTimer()
   const c = chunks.value.find((item) => item.id === ptId)
   if (!c) return
   const sc = lastResult.value?.all_scores[ptId] ?? 0
@@ -247,6 +498,7 @@ function onHoverVector(e: MouseEvent, ptId: number): void {
 }
 
 function onHoverChunk(e: MouseEvent, c: ChunkItem): void {
+  cancelLeaveTimer()
   const sc = lastResult.value?.all_scores[c.id] ?? 0
   const hit = lastResult.value?.hits.find((h) => h.id === c.id)
   hoveredChunk.value = {
@@ -261,14 +513,22 @@ function onHoverChunk(e: MouseEvent, c: ChunkItem): void {
 }
 
 function onMoveBar(e: MouseEvent): void {
+  cancelLeaveTimer()
   if (hoveredChunk.value) {
     updateHoverPos(e)
   }
 }
 
 function onLeaveBar(): void {
-  hoveredChunk.value = null
+  cancelLeaveTimer()
+  leaveTimer = setTimeout(() => {
+    hoveredChunk.value = null
+  }, 80)
 }
+
+onUnmounted(() => {
+  cancelLeaveTimer()
+})
 
 useEventListener(window, 'keydown', (e: KeyboardEvent) => {
   if (e.key === 'Escape') {
@@ -483,17 +743,8 @@ async function buildIndex(): Promise<void> {
       )
       indexInfo.value = result.info
       chunks.value = result.chunks
-      pcaData.value = {
-        points: result.chunks.map((_, i) => ({
-          id: i,
-          x: ((i % 5) - 2) * 0.35,
-          y: (Math.floor(i / 5) - 1) * 0.4,
-          score: 0,
-          is_top: false,
-        })),
-        query: null,
-        var_kept: 0.65,
-      }
+      const initialScores = Array.from({ length: result.chunks.length }, () => 0)
+      pcaData.value = computeClientPca(clientPipeline.vectors, null, initialScores, [])
     }
   } catch (error) {
     console.error('Index failed:', error)
@@ -1823,20 +2074,280 @@ onMounted(async () => {
                 </div>
               </div>
 
-              <!-- TAB 2: VECTORS 2D (PCA) -->
+              <!-- TAB 2: VECTORS 3D / 2D (PCA) -->
               <div v-if="activeTab === 'vectors'" class="space-y-3.5">
-                <div class="text-xs text-text-secondary flex justify-between items-center">
-                  <span>Không gian vector 2D (Bấm vào điểm để xem chi tiết):</span>
-                  <span class="text-[10px] font-mono text-text-dim"
-                    >Variance ~{{ Math.round((pcaData?.var_kept ?? 0.6) * 100) }}%</span
-                  >
+                <!-- Header Controls: Title, Variance, Reset Camera, 2D/3D Switcher -->
+                <div class="flex flex-wrap justify-between items-center gap-2">
+                  <div class="flex items-center gap-2">
+                    <span class="text-xs text-text-secondary font-medium">
+                      {{
+                        vectorViewMode === '3d'
+                          ? 'Không gian vector 3D PCA'
+                          : 'Không gian vector 2D PCA'
+                      }}:
+                    </span>
+                    <span
+                      class="text-[10px] font-mono px-2 py-0.5 bg-bg-deep border border-border-default text-text-dim rounded-xs"
+                    >
+                      Variance ~{{
+                        Math.round(
+                          (pcaData?.var_kept ?? (vectorViewMode === '3d' ? 0.82 : 0.65)) * 100,
+                        )
+                      }}%
+                    </span>
+                  </div>
+
+                  <div class="flex items-center gap-2">
+                    <!-- Nút Reset Camera 3D -->
+                    <button
+                      v-if="vectorViewMode === '3d'"
+                      type="button"
+                      class="px-2 py-0.5 text-[10px] font-mono text-text-secondary hover:text-text-primary border border-border-default hover:border-accent-sky/60 bg-bg-deep rounded-xs transition-colors flex items-center gap-1 cursor-pointer"
+                      title="Khôi phục góc xoay và phóng to mặc định"
+                      @click="resetCamera3D"
+                    >
+                      <Icon icon="lucide:rotate-ccw" class="size-2.5 text-accent-sky" />
+                      <span>Reset góc nhìn</span>
+                    </button>
+
+                    <!-- Toggle 2D / 3D -->
+                    <div
+                      class="inline-flex p-0.5 bg-bg-deep border border-border-default rounded-xs font-mono text-[11px]"
+                    >
+                      <button
+                        type="button"
+                        class="px-2.5 py-0.5 rounded-2xs font-semibold transition-all cursor-pointer flex items-center gap-1"
+                        :class="
+                          vectorViewMode === '3d'
+                            ? 'bg-accent-coral text-bg-deep shadow-xs'
+                            : 'text-text-dim hover:text-text-primary'
+                        "
+                        @click="vectorViewMode = '3d'"
+                      >
+                        <Icon icon="lucide:box" class="size-3" />
+                        <span>3D</span>
+                      </button>
+                      <button
+                        type="button"
+                        class="px-2.5 py-0.5 rounded-2xs font-semibold transition-all cursor-pointer flex items-center gap-1"
+                        :class="
+                          vectorViewMode === '2d'
+                            ? 'bg-accent-sky text-bg-deep shadow-xs'
+                            : 'text-text-dim hover:text-text-primary'
+                        "
+                        @click="vectorViewMode = '2d'"
+                      >
+                        <Icon icon="lucide:square" class="size-3" />
+                        <span>2D</span>
+                      </button>
+                    </div>
+                  </div>
                 </div>
 
+                <!-- Viewport Container (Drag to rotate, Scroll to zoom, Dblclick to reset) -->
                 <div
-                  class="w-full h-80 bg-bg-deep border border-border-default relative flex items-center justify-center p-3 rounded-xs"
+                  class="w-full h-80 sm:h-96 bg-bg-deep border border-border-default relative flex items-center justify-center p-3 rounded-xs overflow-hidden select-none touch-none"
+                  :class="
+                    vectorViewMode === '3d'
+                      ? isDragging3D
+                        ? 'cursor-grabbing'
+                        : 'cursor-grab'
+                      : ''
+                  "
+                  @pointerdown="vectorViewMode === '3d' ? onStartDrag3D($event) : null"
+                  @wheel="vectorViewMode === '3d' ? onWheel3D($event) : null"
+                  @dblclick="vectorViewMode === '3d' ? resetCamera3D() : null"
                 >
+                  <!-- 3D Controls hint badge -->
+                  <div
+                    v-if="vectorViewMode === '3d'"
+                    class="absolute bottom-2.5 left-2.5 z-10 px-2 py-1 bg-bg-surface/85 backdrop-blur-xs border border-border-default/60 rounded-xs text-[10px] font-mono text-text-dim pointer-events-none flex items-center gap-1.5 shadow-xs"
+                  >
+                    <Icon icon="lucide:move-3d" class="size-3 text-accent-sky" />
+                    <span>Kéo để xoay 360° · Cuộn để zoom · Đúp chuột để reset</span>
+                  </div>
+
+                  <!-- 3D SVG VIEWPORT -->
                   <svg
-                    v-if="pcaData && pcaData.points.length > 0"
+                    v-if="vectorViewMode === '3d' && pcaData && pcaData.points.length > 0"
+                    viewBox="-1.2 -1.2 2.4 2.4"
+                    class="w-full h-full"
+                  >
+                    <!-- 3D Bounding Cube Wireframe -->
+                    <g class="pointer-events-none opacity-30">
+                      <line
+                        v-for="(edge, eIdx) in projectedWireframe3D"
+                        :key="`edge-${eIdx}`"
+                        :x1="edge.x1"
+                        :y1="edge.y1"
+                        :x2="edge.x2"
+                        :y2="edge.y2"
+                        stroke="#4A6180"
+                        stroke-width="0.008"
+                        stroke-dasharray="0.04"
+                      />
+                    </g>
+
+                    <!-- 3D Coordinate Axes (PC1, PC2, PC3) -->
+                    <g class="pointer-events-none">
+                      <!-- Trục PC1 (X - Coral) -->
+                      <line
+                        :x1="projectedAxes3D.origin.sx"
+                        :y1="projectedAxes3D.origin.sy"
+                        :x2="projectedAxes3D.x.sx"
+                        :y2="projectedAxes3D.x.sy"
+                        stroke="#FF6B6B"
+                        stroke-width="0.012"
+                        opacity="0.75"
+                      />
+                      <text
+                        :x="projectedAxes3D.x.sx + 0.03"
+                        :y="projectedAxes3D.x.sy + 0.03"
+                        font-size="0.06"
+                        fill="#FF6B6B"
+                        font-family="monospace"
+                        font-weight="bold"
+                      >
+                        PC1
+                      </text>
+
+                      <!-- Trục PC2 (Y - Sky) -->
+                      <line
+                        :x1="projectedAxes3D.origin.sx"
+                        :y1="projectedAxes3D.origin.sy"
+                        :x2="projectedAxes3D.y.sx"
+                        :y2="projectedAxes3D.y.sy"
+                        stroke="#38BDF8"
+                        stroke-width="0.012"
+                        opacity="0.75"
+                      />
+                      <text
+                        :x="projectedAxes3D.y.sx + 0.03"
+                        :y="projectedAxes3D.y.sy + 0.03"
+                        font-size="0.06"
+                        fill="#38BDF8"
+                        font-family="monospace"
+                        font-weight="bold"
+                      >
+                        PC2
+                      </text>
+
+                      <!-- Trục PC3 (Z - Amber) -->
+                      <line
+                        :x1="projectedAxes3D.origin.sx"
+                        :y1="projectedAxes3D.origin.sy"
+                        :x2="projectedAxes3D.z.sx"
+                        :y2="projectedAxes3D.z.sy"
+                        stroke="#FFB830"
+                        stroke-width="0.012"
+                        opacity="0.75"
+                      />
+                      <text
+                        :x="projectedAxes3D.z.sx + 0.03"
+                        :y="projectedAxes3D.z.sy + 0.03"
+                        font-size="0.06"
+                        fill="#FFB830"
+                        font-family="monospace"
+                        font-weight="bold"
+                      >
+                        PC3
+                      </text>
+                    </g>
+
+                    <!-- 3D Lines connecting Query to Top-K Chunks -->
+                    <g v-if="projectedQueryPoint3D" class="pointer-events-none">
+                      <line
+                        v-for="(link, lIdx) in projectedQueryLinks3D"
+                        :key="`link3d-${lIdx}`"
+                        :x1="link.x1"
+                        :y1="link.y1"
+                        :x2="link.x2"
+                        :y2="link.y2"
+                        stroke="#FFB830"
+                        stroke-width="0.014"
+                        stroke-dasharray="0.03"
+                        opacity="0.8"
+                      />
+                    </g>
+
+                    <!-- 3D Query Point with Pulse -->
+                    <g v-if="projectedQueryPoint3D" class="pointer-events-none">
+                      <circle
+                        :cx="projectedQueryPoint3D.sx"
+                        :cy="projectedQueryPoint3D.sy"
+                        :r="0.08 * projectedQueryPoint3D.scale"
+                        fill="#FFB830"
+                        opacity="0.25"
+                        class="animate-ping pointer-events-none"
+                      />
+                      <circle
+                        :cx="projectedQueryPoint3D.sx"
+                        :cy="projectedQueryPoint3D.sy"
+                        :r="0.06 * projectedQueryPoint3D.scale"
+                        fill="#FFB830"
+                        stroke="#FFFFFF"
+                        :stroke-width="0.012 * projectedQueryPoint3D.scale"
+                      />
+                      <text
+                        :x="projectedQueryPoint3D.sx + 0.08 * projectedQueryPoint3D.scale"
+                        :y="projectedQueryPoint3D.sy + 0.03 * projectedQueryPoint3D.scale"
+                        :font-size="0.07 * projectedQueryPoint3D.scale"
+                        fill="#FFB830"
+                        font-family="monospace"
+                        font-weight="bold"
+                      >
+                        Query
+                      </text>
+                    </g>
+
+                    <!-- 3D Chunk Points (Depth-sorted, tương tác chính xác) -->
+                    <g
+                      v-for="pt in projectedChunkPoints3D"
+                      :key="`pt3d-${pt.id}`"
+                      class="cursor-pointer"
+                      @click="openChunkModal(pt.id)"
+                      @mouseenter="onHoverVector($event, pt.id)"
+                      @mousemove="onMoveBar($event)"
+                      @mouseleave="onLeaveBar"
+                    >
+                      <!-- Quầng sáng hiệu ứng khi hover -->
+                      <circle
+                        v-if="hoveredChunk?.id === pt.id"
+                        :cx="pt.sx"
+                        :cy="pt.sy"
+                        :r="(pt.is_top ? 0.08 : 0.06) * pt.projScale"
+                        :fill="pt.is_top ? '#38BDF8' : '#4A6180'"
+                        opacity="0.35"
+                        class="pointer-events-none"
+                      />
+
+                      <!-- Điểm vector 3D trực quan -->
+                      <circle
+                        :cx="pt.sx"
+                        :cy="pt.sy"
+                        :r="
+                          (hoveredChunk?.id === pt.id
+                            ? pt.is_top
+                              ? 0.068
+                              : 0.046
+                            : pt.is_top
+                              ? 0.055
+                              : 0.035) * pt.projScale
+                        "
+                        :fill="pt.is_top ? '#38BDF8' : '#4A6180'"
+                        :stroke="
+                          hoveredChunk?.id === pt.id ? '#FFFFFF' : pt.is_top ? '#FFFFFF' : '#162232'
+                        "
+                        :stroke-width="(hoveredChunk?.id === pt.id ? 0.015 : 0.01) * pt.projScale"
+                        :opacity="Math.max(0.45, Math.min(1.0, 0.9 - pt.depth * 0.25))"
+                        class="transition-all duration-150"
+                      />
+                    </g>
+                  </svg>
+
+                  <!-- 2D SVG VIEWPORT (Chế độ phẳng truyền thống) -->
+                  <svg
+                    v-else-if="vectorViewMode === '2d' && pcaData && pcaData.points.length > 0"
                     viewBox="-1.2 -1.2 2.4 2.4"
                     class="w-full h-full"
                   >
@@ -1849,6 +2360,7 @@ onMounted(async () => {
                       stroke="#253549"
                       stroke-dasharray="0.05"
                       stroke-width="0.01"
+                      class="pointer-events-none"
                     />
                     <line
                       x1="0"
@@ -1858,10 +2370,11 @@ onMounted(async () => {
                       stroke="#253549"
                       stroke-dasharray="0.05"
                       stroke-width="0.01"
+                      class="pointer-events-none"
                     />
 
                     <!-- Links from query to top-k -->
-                    <g v-if="pcaData.query">
+                    <g v-if="pcaData.query" class="pointer-events-none">
                       <line
                         v-for="pt in pcaData.points.filter((p) => p.is_top)"
                         :key="`line-${pt.id}`"
@@ -1873,35 +2386,19 @@ onMounted(async () => {
                         stroke-width="0.015"
                         stroke-dasharray="0.03"
                         opacity="0.8"
+                        class="pointer-events-none"
                       />
                     </g>
 
-                    <!-- Chunk Points (Click mở Modal, Hover hiện Popup) -->
-                    <circle
-                      v-for="pt in pcaData.points"
-                      :key="`pt-${pt.id}`"
-                      :cx="pt.x"
-                      :cy="pt.y"
-                      :r="pt.is_top ? 0.055 : 0.035"
-                      :fill="pt.is_top ? '#38BDF8' : '#4A6180'"
-                      :stroke="pt.is_top ? '#FFFFFF' : '#162232'"
-                      stroke-width="0.01"
-                      class="cursor-pointer transition-transform hover:scale-135"
-                      @click="openChunkModal(pt.id)"
-                      @mouseenter="onHoverVector($event, pt.id)"
-                      @mousemove="onMoveBar($event)"
-                      @mouseleave="onLeaveBar"
-                    />
-
                     <!-- Query Point with Pulse -->
-                    <g v-if="pcaData.query">
+                    <g v-if="pcaData.query" class="pointer-events-none">
                       <circle
                         :cx="pcaData.query.x"
                         :cy="pcaData.query.y"
                         r="0.09"
                         fill="#FFB830"
                         opacity="0.25"
-                        class="animate-ping"
+                        class="animate-ping pointer-events-none"
                       />
                       <circle
                         :cx="pcaData.query.x"
@@ -1910,6 +2407,7 @@ onMounted(async () => {
                         fill="#FFB830"
                         stroke="#FFFFFF"
                         stroke-width="0.015"
+                        class="pointer-events-none"
                       />
                       <text
                         :x="pcaData.query.x + 0.08"
@@ -1918,9 +2416,53 @@ onMounted(async () => {
                         fill="#FFB830"
                         font-family="monospace"
                         font-weight="bold"
+                        class="pointer-events-none"
                       >
                         Query
                       </text>
+                    </g>
+
+                    <!-- Chunk Points 2D -->
+                    <g
+                      v-for="pt in pcaData.points"
+                      :key="`pt2d-${pt.id}`"
+                      class="cursor-pointer"
+                      @click="openChunkModal(pt.id)"
+                      @mouseenter="onHoverVector($event, pt.id)"
+                      @mousemove="onMoveBar($event)"
+                      @mouseleave="onLeaveBar"
+                    >
+                      <!-- Quầng sáng hiệu ứng khi hover -->
+                      <circle
+                        v-if="hoveredChunk?.id === pt.id"
+                        :cx="pt.x"
+                        :cy="pt.y"
+                        :r="pt.is_top ? 0.08 : 0.06"
+                        :fill="pt.is_top ? '#38BDF8' : '#4A6180'"
+                        opacity="0.3"
+                        class="pointer-events-none"
+                      />
+
+                      <!-- Điểm vector 2D -->
+                      <circle
+                        :cx="pt.x"
+                        :cy="pt.y"
+                        :r="
+                          hoveredChunk?.id === pt.id
+                            ? pt.is_top
+                              ? 0.068
+                              : 0.046
+                            : pt.is_top
+                              ? 0.055
+                              : 0.035
+                        "
+                        :fill="pt.is_top ? '#38BDF8' : '#4A6180'"
+                        :stroke="
+                          hoveredChunk?.id === pt.id ? '#FFFFFF' : pt.is_top ? '#FFFFFF' : '#162232'
+                        "
+                        :stroke-width="hoveredChunk?.id === pt.id ? 0.015 : 0.01"
+                        class="transition-all duration-150"
+                      />
                     </g>
                   </svg>
 
@@ -1931,7 +2473,7 @@ onMounted(async () => {
 
                 <!-- Legend -->
                 <div
-                  class="flex items-center justify-center gap-5 text-[11px] font-mono text-text-secondary"
+                  class="flex flex-wrap items-center justify-center gap-4 sm:gap-6 text-[11px] font-mono text-text-secondary"
                 >
                   <div class="flex items-center gap-1.5">
                     <span class="size-2.5 rounded-full bg-accent-amber"></span>
@@ -1944,6 +2486,15 @@ onMounted(async () => {
                   <div class="flex items-center gap-1.5">
                     <span class="size-2.5 rounded-full bg-[#4A6180]"></span>
                     <span>Khác</span>
+                  </div>
+                  <div
+                    v-if="vectorViewMode === '3d'"
+                    class="hidden md:flex items-center gap-2 text-text-dim border-l border-border-default/60 pl-4"
+                  >
+                    <span>Trục:</span>
+                    <span class="text-[#FF6B6B]">PC1 (X)</span>
+                    <span class="text-[#38BDF8]">PC2 (Y)</span>
+                    <span class="text-[#FFB830]">PC3 (Z)</span>
                   </div>
                 </div>
               </div>
@@ -2135,7 +2686,7 @@ onMounted(async () => {
         :style="{ left: `${hoverPos.x}px`, top: `${hoverPos.y}px` }"
       >
         <div
-          class="w-80 md:w-96 max-w-[calc(100vw-24px)] bg-bg-surface/95 backdrop-blur-md border border-accent-sky/60 rounded-sm shadow-2xl p-3 space-y-2 text-xs text-text-primary"
+          class="w-80 md:w-96 max-w-[calc(100vw-24px)] pointer-events-none select-none bg-bg-surface/95 backdrop-blur-md border border-accent-sky/60 rounded-sm shadow-2xl p-3 space-y-2 text-xs text-text-primary"
         >
           <!-- Popup Header -->
           <div

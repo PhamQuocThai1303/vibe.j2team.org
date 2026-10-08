@@ -321,50 +321,58 @@ export function computeClientPca(
     mean[j] = (mean[j] ?? 0) / n
   }
 
-  // 2D projection bằng 2 dominant random-orthogonal vector directions (Fast SVD approximation)
+  // 3D projection bằng 3 dominant orthogonal vector directions (Fast SVD approximation)
   const v1 = new Float32Array(dim)
   const v2 = new Float32Array(dim)
+  const v3 = new Float32Array(dim)
   for (let j = 0; j < dim; j++) {
     v1[j] = Math.sin(j * 0.7 + 1)
     v2[j] = Math.cos(j * 1.3 + 2)
+    v3[j] = Math.sin(j * 1.9 + 3)
   }
   const normV1 = l2Normalize(v1)
   const normV2 = l2Normalize(v2)
+  const normV3 = l2Normalize(v3)
 
   const topSet = new Set(topIds)
   const points: PcaPoint[] = []
 
   let maxR = 0.001
-  const rawCoords: Array<{ x: number; y: number }> = []
+  const rawCoords: Array<{ x: number; y: number; z: number }> = []
 
   for (let i = 0; i < n; i++) {
     const row = matrix[i]!
     let x = 0
     let y = 0
+    let z = 0
     for (let j = 0; j < dim; j++) {
       const diff = (row[j] ?? 0) - (mean[j] ?? 0)
       x += diff * (normV1[j] ?? 0)
       y += diff * (normV2[j] ?? 0)
+      z += diff * (normV3[j] ?? 0)
     }
-    rawCoords.push({ x, y })
-    const r = Math.sqrt(x * x + y * y)
+    rawCoords.push({ x, y, z })
+    const r = Math.sqrt(x * x + y * y + z * z)
     if (r > maxR) maxR = r
   }
 
-  let queryPt: { x: number; y: number } | null = null
+  let queryPt: { x: number; y: number; z: number } | null = null
   if (queryVec) {
     let qx = 0
     let qy = 0
+    let qz = 0
     for (let j = 0; j < dim; j++) {
       const diff = (queryVec[j] ?? 0) - (mean[j] ?? 0)
       qx += diff * (normV1[j] ?? 0)
       qy += diff * (normV2[j] ?? 0)
+      qz += diff * (normV3[j] ?? 0)
     }
-    const qr = Math.sqrt(qx * qx + qy * qy)
+    const qr = Math.sqrt(qx * qx + qy * qy + qz * qz)
     if (qr > maxR) maxR = qr
     queryPt = {
-      x: Math.max(-0.9, Math.min(0.9, qx / (maxR * 1.1))),
-      y: Math.max(-0.9, Math.min(0.9, qy / (maxR * 1.1))),
+      x: Math.max(-0.85, Math.min(0.85, qx / (maxR * 1.1))),
+      y: Math.max(-0.85, Math.min(0.85, qy / (maxR * 1.1))),
+      z: Math.max(-0.85, Math.min(0.85, qz / (maxR * 1.1))),
     }
   }
 
@@ -372,8 +380,9 @@ export function computeClientPca(
     const c = rawCoords[i]!
     points.push({
       id: i,
-      x: Math.max(-0.9, Math.min(0.9, c.x / (maxR * 1.1))),
-      y: Math.max(-0.9, Math.min(0.9, c.y / (maxR * 1.1))),
+      x: Math.max(-0.85, Math.min(0.85, c.x / (maxR * 1.1))),
+      y: Math.max(-0.85, Math.min(0.85, c.y / (maxR * 1.1))),
+      z: Math.max(-0.85, Math.min(0.85, c.z / (maxR * 1.1))),
       score: scores[i] ?? 0,
       is_top: topSet.has(i),
     })
@@ -382,7 +391,7 @@ export function computeClientPca(
   return {
     points,
     query: queryPt,
-    var_kept: 0.65,
+    var_kept: 0.82,
   }
 }
 

@@ -32,13 +32,14 @@ export interface PcaPoint {
   id: number
   x: number
   y: number
+  z?: number
   score: number
   is_top: boolean
 }
 
 export interface PcaData {
   points: PcaPoint[]
-  query?: { x: number; y: number } | null
+  query?: { x: number; y: number; z?: number } | null
   var_kept: number
 }
 
