@@ -143,6 +143,17 @@ class RagBridgeHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+            has_pymupdf = False
+            try:
+                import pymupdf  # noqa: F401
+                has_pymupdf = True
+            except Exception:
+                try:
+                    import fitz  # noqa: F401
+                    has_pymupdf = True
+                except Exception:
+                    pass
+
             is_ready = pipeline.store is not None and pipeline.store.ready
             chunks_data = [
                 {
@@ -165,6 +176,7 @@ class RagBridgeHandler(BaseHTTPRequestHandler):
                 "mode": "retrieve-only",
                 "python_version": sys.version.split()[0],
                 "has_sentence_transformers": has_st,
+                "has_pymupdf": has_pymupdf,
                 "is_indexed": is_ready,
                 "n_docs": len(current_docs),
                 "n_chunks": len(pipeline.chunks) if is_ready else 0,
@@ -203,6 +215,41 @@ class RagBridgeHandler(BaseHTTPRequestHandler):
                     "docs_count": len(current_docs),
                     "total_chars": sum(len(d[1]) for d in current_docs)
                 })
+
+            elif path == "/api/parse-pdf":
+                filename = payload.get("filename", "tailieu.pdf")
+                content_base64 = payload.get("content_base64", "")
+                if not content_base64:
+                    return self._send_error("Thiếu nội dung 'content_base64' của tệp PDF")
+
+                if "," in content_base64:
+                    content_base64 = content_base64.split(",", 1)[1]
+
+                import base64
+                try:
+                    pdf_bytes = base64.b64decode(content_base64)
+                    text, page_count = R.extract_text_from_pdf_bytes(pdf_bytes)
+
+                    if not text:
+                        return self._send_json({
+                            "status": "warning",
+                            "filename": filename,
+                            "text": "",
+                            "pages": page_count,
+                            "message": "Tệp PDF không có lớp ký tự văn bản (có thể là file scan hoặc toàn hình ảnh)."
+                        })
+
+                    self._send_json({
+                        "status": "ok",
+                        "filename": filename,
+                        "text": text,
+                        "pages": page_count,
+                        "length": len(text),
+                        "parser": "pymupdf"
+                    })
+                except Exception as ex:
+                    traceback.print_exc()
+                    return self._send_error(f"Lỗi khi phân tách PDF bằng PyMuPDF: {str(ex)}")
 
             elif path == "/api/index":
                 if not current_docs:

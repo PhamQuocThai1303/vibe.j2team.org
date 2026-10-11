@@ -41,9 +41,12 @@ def load_text(path: str) -> str:
 
     if ext == ".pdf":
         try:
-            import fitz  # type: ignore
-        except ImportError as exc:
-            raise RuntimeError("Đọc PDF cần:  pip install pymupdf") from exc
+            import pymupdf as fitz
+        except ImportError:
+            try:
+                import fitz
+            except ImportError as exc:
+                raise RuntimeError("Đọc PDF cần: pip install pymupdf") from exc
         with fitz.open(path) as doc:
             return "\n\n".join(pg.get_text() for pg in doc)
 
@@ -57,6 +60,26 @@ def load_text(path: str) -> str:
         raise RuntimeError(f"Không giải mã được: {path}")
 
     raise RuntimeError(f"Định dạng không hỗ trợ: {ext}")
+
+
+def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, int]:
+    """Phân tách nội dung văn bản thuần và số trang từ byte data của tệp PDF bằng PyMuPDF."""
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        try:
+            import fitz
+        except ImportError as exc:
+            raise RuntimeError("Đọc PDF cần: pip install pymupdf") from exc
+
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        pages_text: List[str] = []
+        for i, page in enumerate(doc):
+            t = page.get_text().strip()
+            if t:
+                pages_text.append(f"--- [Trang {i + 1}] ---\n" + t)
+        full_text = "\n\n".join(pages_text) if pages_text else ""
+        return normalize(full_text), len(doc)
 
 
 def normalize(text: str) -> str:

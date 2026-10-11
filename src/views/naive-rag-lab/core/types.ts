@@ -95,3 +95,9 @@ export interface ChatMessage {
 
 export type ChunkStrategy = 'By Paragraph' | 'Fixed Character' | 'By Sentence'
 export type EmbedderType = 'TF-IDF' | 'Hashing' | 'Sentence-Transformers'
+
+export interface PdfParseResult {
+  text: string
+  pages: number
+  parser: 'pymupdf' | 'client-pdfjs'
+}

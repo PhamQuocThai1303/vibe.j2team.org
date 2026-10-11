@@ -6,6 +6,7 @@ import type {
   IndexInfo,
   PcaData,
   PcaPoint,
+  PdfParseResult,
   RetrieveResult,
 } from './types'
 
@@ -562,5 +563,148 @@ export class ClientRagPipeline {
       },
       pca,
     }
+  }
+}
+
+interface PdfTextItem {
+  str?: string
+}
+
+interface PdfTextContent {
+  items: Array<PdfTextItem | Record<string, never>>
+}
+
+interface PdfPageProxy {
+  getTextContent(): Promise<PdfTextContent>
+}
+
+interface PdfDocumentProxy {
+  numPages: number
+  getPage(pageNumber: number): Promise<PdfPageProxy>
+}
+
+interface PdfLoadingTask {
+  promise: Promise<PdfDocumentProxy>
+}
+
+interface PdfJsLib {
+  GlobalWorkerOptions: {
+    workerSrc: string
+  }
+  getDocument(params: { data: ArrayBuffer }): PdfLoadingTask
+}
+
+interface WindowWithPdfJs extends Window {
+  pdfjsLib?: PdfJsLib
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const res = (reader.result as string) || ''
+      const base64 = res.includes(',') ? (res.split(',')[1] ?? '') : res
+      resolve(base64)
+    }
+    reader.onerror = () => reject(new Error('Không thể đọc dữ liệu file'))
+    reader.readAsDataURL(file)
+  })
+}
+
+/**
+ * Phân tách nội dung văn bản từ file PDF:
+ * 1. Ưu tiên gửi sang Python Bridge (/api/parse-pdf) để xử lý bằng PyMuPDF.
+ * 2. Tự động chuyển tiếp sang PDF.js trong trình duyệt nếu Python Bridge không kết nối.
+ */
+export async function parsePdfFile(file: File, bridgeUrl?: string): Promise<PdfParseResult> {
+  // 1. Thử gọi PyMuPDF qua Python Bridge nếu có kết nối
+  if (bridgeUrl) {
+    try {
+      const base64 = await fileToBase64(file)
+      const resp = await fetch(`${bridgeUrl}/api/parse-pdf`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: file.name, content_base64: base64 }),
+      })
+      if (resp.ok) {
+        const data = (await resp.json()) as {
+          status: string
+          text?: string
+          pages?: number
+          message?: string
+        }
+        if (data.status === 'ok' && data.text) {
+          return {
+            text: data.text,
+            pages: data.pages ?? 1,
+            parser: 'pymupdf',
+          }
+        }
+        if (data.status === 'warning') {
+          throw new Error(data.message || 'Tệp PDF không có lớp ký tự văn bản.')
+        }
+      }
+    } catch (bridgeErr) {
+      if (bridgeErr instanceof Error && bridgeErr.message.includes('lớp ký tự')) {
+        throw bridgeErr
+      }
+      // Tiếp tục fallback sang client PDF.js
+    }
+  }
+
+  // 2. Client Fallback: tải PDF.js qua CDN nếu Python Bridge offline
+  const win = window as WindowWithPdfJs
+  if (!win.pdfjsLib) {
+    await new Promise<void>((resolve, reject) => {
+      const script = document.createElement('script')
+      script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
+      script.onload = () => {
+        if (win.pdfjsLib) {
+          win.pdfjsLib.GlobalWorkerOptions.workerSrc =
+            'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
+        }
+        resolve()
+      }
+      script.onerror = () =>
+        reject(
+          new Error(
+            'Không thể tải trình đọc PDF. Vui lòng chạy Python Bridge (python bridge.py) để dùng PyMuPDF.',
+          ),
+        )
+      document.head.appendChild(script)
+    })
+  }
+
+  const pdfjs = win.pdfjsLib
+  if (!pdfjs) {
+    throw new Error('Trình đọc PDF chưa sẵn sàng.')
+  }
+
+  const arrayBuffer = await file.arrayBuffer()
+  const loadingTask = pdfjs.getDocument({ data: arrayBuffer })
+  const pdfDoc = await loadingTask.promise
+
+  const pageTexts: string[] = []
+  for (let i = 1; i <= pdfDoc.numPages; i++) {
+    const page = await pdfDoc.getPage(i)
+    const tokenized = await page.getTextContent()
+    const pageStr = tokenized.items
+      .map((item) => ('str' in item && typeof item.str === 'string' ? item.str : ''))
+      .join(' ')
+      .trim()
+    if (pageStr) {
+      pageTexts.push(`--- [Trang ${i}] ---\n${pageStr}`)
+    }
+  }
+
+  const fullText = normalizeText(pageTexts.join('\n\n'))
+  if (!fullText) {
+    throw new Error('Tệp PDF không chứa nội dung văn bản nào (có thể là file scan hoặc hình ảnh).')
+  }
+
+  return {
+    text: fullText,
+    pages: pdfDoc.numPages,
+    parser: 'client-pdfjs',
   }
 }

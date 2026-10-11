@@ -14,12 +14,22 @@ import type {
   PcaData,
   RetrieveResult,
 } from './core/types'
-import { ClientRagPipeline, computeClientPca, SAMPLE_DOC_TEXT } from './core/rag-engine'
+import {
+  ClientRagPipeline,
+  computeClientPca,
+  parsePdfFile,
+  SAMPLE_DOC_TEXT,
+} from './core/rag-engine'
 
 // --- Cấu hình & Trạng thái Engine ---
 const bridgeUrl = ref('http://127.0.0.1:8000')
 const engineMode = ref<'python' | 'browser'>('browser')
 const isBridgeConnected = ref(false)
+
+// Trạng thái đọc file PDF (PyMuPDF / PDF.js)
+const isParsingFile = ref(false)
+const parsingStatusText = ref('')
+const lastParsedPdfInfo = ref<{ name: string; pages: number; parser: string } | null>(null)
 
 // Trạng thái Pipeline
 const currentStep = ref<number>(0) // 0: chưa chạy, 1: LOAD, 2: CHUNK, 3: EMBED, 4: RETRIEVE, 5: GENERATE
@@ -605,34 +615,80 @@ function loadSampleDocument(): void {
   resetPipelineProgress()
 }
 
-function handleFileUpload(event: Event): void {
+async function handleFileUpload(event: Event): Promise<void> {
   const input = event.target as HTMLInputElement
   if (!input.files || input.files.length === 0) return
 
   const fileList = Array.from(input.files)
-  const newDocs: DocItem[] = []
+  isParsingFile.value = true
+  lastParsedPdfInfo.value = null
 
-  let loadedCount = 0
-  for (const file of fileList) {
-    const reader = new FileReader()
-    reader.onload = (e) => {
-      const content = (e.target?.result as string) || ''
-      newDocs.push({
-        name: file.name,
-        content,
-        length: content.length,
-      })
-      loadedCount++
-      if (loadedCount === fileList.length) {
-        docs.value = newDocs
-        directTextInput.value = newDocs.map((d) => d.content).join('\n\n')
-        if (newDocs[0]) {
-          docEditorFilename.value = newDocs[0].name
+  try {
+    const newDocs: DocItem[] = []
+
+    for (const file of fileList) {
+      const isPdf = file.name.toLowerCase().endsWith('.pdf') || file.type === 'application/pdf'
+
+      if (isPdf) {
+        parsingStatusText.value = `Đang phân tách "${file.name}"`
+        try {
+          const parsed = await parsePdfFile(file, bridgeUrl.value)
+          newDocs.push({
+            name: file.name,
+            content: parsed.text,
+            length: parsed.text.length,
+          })
+          lastParsedPdfInfo.value = {
+            name: file.name,
+            pages: parsed.pages,
+            parser: parsed.parser === 'pymupdf' ? 'PyMuPDF' : 'PDF.js Client',
+          }
+        } catch (pdfErr) {
+          const msg = pdfErr instanceof Error ? pdfErr.message : String(pdfErr)
+          alert(`Không thể đọc tệp PDF "${file.name}":\n${msg}`)
         }
-        resetPipelineProgress()
+      } else {
+        parsingStatusText.value = `Đang đọc "${file.name}"...`
+        const text = await new Promise<string>((resolve) => {
+          const reader = new FileReader()
+          reader.onload = (e) => resolve((e.target?.result as string) || '')
+          reader.onerror = () => resolve('')
+          reader.readAsText(file)
+        })
+        newDocs.push({
+          name: file.name,
+          content: text,
+          length: text.length,
+        })
       }
     }
-    reader.readAsText(file)
+
+    if (newDocs.length > 0) {
+      docs.value = newDocs
+      directTextInput.value = newDocs.map((d) => d.content).join('\n\n')
+      if (newDocs[0]) {
+        docEditorFilename.value = newDocs[0].name
+      }
+
+      // Tự động đồng bộ lên Python Bridge nếu đang kết nối
+      if (engineMode.value === 'python' && isBridgeConnected.value) {
+        try {
+          await fetch(`${bridgeUrl.value}/api/upload`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ docs: newDocs }),
+          })
+        } catch (syncErr) {
+          console.warn('Lỗi đồng bộ docs lên bridge:', syncErr)
+        }
+      }
+
+      resetPipelineProgress()
+    }
+  } finally {
+    isParsingFile.value = false
+    parsingStatusText.value = ''
+    input.value = ''
   }
 }
 
@@ -1164,14 +1220,20 @@ onMounted(async () => {
             <div class="grid grid-cols-2 gap-2">
               <label
                 class="flex items-center justify-center gap-2 py-2 px-3 border border-border-default bg-bg-deep/60 hover:bg-bg-elevated text-xs font-medium cursor-pointer hover:border-accent-coral/60 transition-all rounded-sm text-center"
+                :class="isParsingFile ? 'opacity-60 pointer-events-none' : ''"
               >
-                <Icon icon="lucide:upload" class="size-3.5 text-accent-sky" />
-                <span>Nạp tệp...</span>
+                <Icon
+                  :icon="isParsingFile ? 'lucide:loader-2' : 'lucide:upload'"
+                  class="size-3.5 text-accent-sky"
+                  :class="isParsingFile ? 'animate-spin' : ''"
+                />
+                <span>{{ isParsingFile ? 'Đang đọc...' : 'Nạp tệp...' }}</span>
                 <input
                   type="file"
                   multiple
-                  accept=".txt,.md,.markdown,.json,.py,.csv"
+                  accept=".txt,.md,.markdown,.json,.py,.csv,.pdf,application/pdf"
                   class="hidden"
+                  :disabled="isParsingFile"
                   @change="handleFileUpload"
                 />
               </label>
@@ -1179,11 +1241,51 @@ onMounted(async () => {
               <button
                 type="button"
                 class="flex items-center justify-center gap-2 py-2 px-3 border border-border-default bg-bg-deep/60 hover:bg-bg-elevated text-xs font-medium hover:border-accent-amber/60 transition-all rounded-sm cursor-pointer"
+                :disabled="isParsingFile"
                 @click="loadSampleDocument"
               >
                 <Icon icon="lucide:book-open" class="size-3.5 text-accent-amber" />
                 <span>Tài liệu mẫu</span>
               </button>
+            </div>
+
+            <!-- Trạng thái phân tách PDF (PyMuPDF) -->
+            <div
+              v-if="isParsingFile"
+              class="p-2 bg-accent-sky/10 border border-accent-sky/30 rounded-xs text-[11px] text-accent-sky flex items-center gap-2 animate-pulse"
+            >
+              <Icon icon="lucide:loader-2" class="size-3.5 animate-spin shrink-0" />
+              <span class="truncate">{{ parsingStatusText }}</span>
+            </div>
+
+            <div
+              v-else-if="lastParsedPdfInfo"
+              class="p-2 bg-accent-coral/10 border border-accent-coral/30 rounded-xs text-[11px] text-text-primary flex items-center justify-between gap-1.5"
+            >
+              <div class="flex items-center gap-1.5 truncate">
+                <Icon icon="lucide:file-check" class="size-3.5 text-accent-coral shrink-0" />
+                <span class="truncate">
+                  Đã đọc <b>{{ lastParsedPdfInfo.name }}</b> ({{ lastParsedPdfInfo.pages }} trang)
+                  qua
+                  <span class="text-accent-coral font-semibold">{{
+                    lastParsedPdfInfo.parser
+                  }}</span>
+                </span>
+              </div>
+              <button
+                type="button"
+                class="text-text-dim hover:text-text-primary text-[10px] ml-1 shrink-0 cursor-pointer"
+                title="Đóng thông báo"
+                @click="lastParsedPdfInfo = null"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div
+              class="text-[10px] text-text-dim flex items-center justify-between font-mono px-0.5"
+            >
+              <span>Hỗ trợ: .txt, .md, .pdf</span>
             </div>
 
             <!-- Xem & chỉnh sửa văn bản (Mở Modal To) -->
